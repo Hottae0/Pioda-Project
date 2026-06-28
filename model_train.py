@@ -56,10 +56,7 @@ def extract_features_from_stt(stt_text, record_time):
     # 4. 문장 복잡도 (형태소 개수)
     complexity = len(pos_tags)
 
-    # 5. 휴지 빈도/길이 (현재 JSON에 없으므로 일단 0.0으로 임시 패딩)
-    pause_time = 0.0
-
-    return [speech_rate, ttr, repetition_rate, complexity, pause_time]
+    return [speech_rate, ttr, repetition_rate, complexity]
 
 
 def process_aihub_zip_to_tensor(zip_path, extract_dir='./aihub_data', seq_length=7):
@@ -95,7 +92,7 @@ def process_aihub_zip_to_tensor(zip_path, extract_dir='./aihub_data', seq_length
             pass  # 손상된 파일이나 형식이 다른 JSON은 가볍게 패스
 
     # DataFrame으로 변환
-    columns = ['recorder_id', 'date', 'speech_rate', 'ttr', 'repetition_rate', 'complexity', 'pause_time']
+    columns = ['recorder_id', 'date', 'speech_rate', 'ttr', 'repetition_rate', 'complexity']
     df = pd.DataFrame(extracted_data, columns=columns)
 
     # 4. 화자별, 시간순으로 정렬 (LSTM 시계열)
@@ -106,7 +103,7 @@ def process_aihub_zip_to_tensor(zip_path, extract_dir='./aihub_data', seq_length
     grouped = df.groupby('recorder_id')
 
     for _, group in grouped:
-        features = group[['speech_rate', 'ttr', 'repetition_rate', 'complexity', 'pause_time']].values
+        features = group[['speech_rate', 'ttr', 'repetition_rate', 'complexity']].values
 
         # 데이터가 seq_length(예: 7)보다 많으면 7개씩 잘라서 묶음
         for i in range(0, len(features) - seq_length + 1, seq_length):
@@ -140,7 +137,7 @@ dataset = TensorDataset(voice_data_normalized, voice_data_normalized)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
 # 3. 모델 세팅
-model = VoiceLSTMAutoencoder(input_dim=5, hidden_dim=16)
+model = VoiceLSTMAutoencoder(input_dim=4, hidden_dim=16)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
@@ -165,3 +162,6 @@ for epoch in range(epochs):
     if (epoch + 1) % 100 == 0:
         # 미니 배치들의 평균 Loss 출력
         print(f'Epoch [{epoch + 1}/{epochs}], Loss: {epoch_loss / len(dataloader):.6f}')
+
+torch.save(model.state_dict(), 'voice_lstm_model.pth')
+print("모델 가중치가 'voice_lstm_model.pth'로 성공적으로 저장")
