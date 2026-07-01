@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 데이터 (로컬 심볼릭 링크 / 대용량 — 커밋 금지)
+aihub_data/
+*.zip
+
+# 로그
+*.log
+
+# OS
+.DS_Store

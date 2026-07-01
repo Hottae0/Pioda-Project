@@ -1,167 +1,138 @@
-import zipfile
-import json
-import os
-import glob
-import pandas as pd
-import numpy as np
+"""
+model_train.py — 음성 지표 기반 LSTM 오토인코더 학습 스크립트
+
+[개요]
+    정상 노인 발화 데이터(AI Hub 자유대화)로 "정상 발화 패턴"을 학습한다.
+    비지도 이상 탐지 방식 — 학습된 정상 패턴을 잘 복원하지 못하는(재구성 오차가 큰)
+    입력을 '이상(인지 저하 의심)'으로 판단한다.
+
+[입력 피처 4개]  (pipeline.extract_features 에서 추출)
+    1) speech_rate      발화 속도   = 순수 음절 수 / 녹음 시간
+    2) ttr              어휘 다양성 = 고유 내용어(명사·동사) / 전체 내용어
+    3) repetition_rate  반복 표현   = 중복 2어절(bigram) 비율
+    4) complexity       문장 복잡도 = 형태소 총 개수
+
+[정규화]  Z-score. 학습 데이터 전체의 피처별 평균/표준편차로 (x-mean)/std.
+          추론 시 동일 통계를 써야 하므로 norm_stats.pt 로 저장한다.
+
+[산출물]
+    voice_autoencoder.pt  학습된 모델 가중치
+    norm_stats.pt         정규화 통계 (mean, std)  ← 추론 시 필수
+    threshold.pt          이상 탐지 임계값 (mean + 2σ)
+
+[실행]  python model_train.py   (데이터: aihub_data/[라벨]1.AI챗봇)
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
-from konlpy.tag import Okt
-from collections import Counter
-from datetime import datetime
+
+from pipeline import load_records_from_dir, build_sequences
 
 
-
+# ── 모델 정의 ──────────────────────────────────────────────
 
 class VoiceLSTMAutoencoder(nn.Module):
-    def __init__(self, input_dim=5, hidden_dim=8, num_layers=1):
-        super(VoiceLSTMAutoencoder, self).__init__()
-
+    """
+    LSTM 오토인코더.
+      encoder      : 시퀀스(seq_len, 4) → 마지막 hidden state로 압축
+      decoder_lstm : 압축된 벡터를 seq_len 길이로 다시 펼쳐 복원
+      output_layer : hidden_dim → 원래 피처 차원(4)로 매핑
+    입력을 그대로 복원(reconstruct)하도록 학습하며, 복원 오차(MSE)를 이상 점수로 쓴다.
+    """
+    def __init__(self, input_dim=4, hidden_dim=32, num_layers=2):
+        super().__init__()
         self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         self.decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
         self.output_layer = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, x):
         _, (hidden, _) = self.encoder(x)
-        seq_length = x.size(1)
-        hidden_last = hidden[-1].unsqueeze(1).repeat(1, seq_length, 1)
-
-        decoded_seq, _ = self.decoder_lstm(hidden_last)
-        out = self.output_layer(decoded_seq)
-        return out
-
-# 형태소 분석기 초기화
-okt = Okt()
-
-def extract_features_from_stt(stt_text, record_time):
-    """텍스트와 녹음 시간에서 4가지 지표를 추출하는 함수"""
-    # 1. 발화 속도
-    pure_text = stt_text.replace(" ", "")
-    speech_rate = len(pure_text) / record_time if record_time > 0 else 0
-
-    # 2. 어휘 다양성 (TTR)
-    pos_tags = okt.pos(stt_text)
-    content_words = [word for word, pos in pos_tags if pos in ['Noun', 'Verb']]
-    ttr = len(set(content_words)) / len(content_words) if content_words else 0
-
-    # 3. 반복 표현 비율
-    words = stt_text.split()
-    bigrams = [f"{words[i]} {words[i + 1]}" for i in range(len(words) - 1)]
-    repeated = sum(1 for count in Counter(bigrams).values() if count > 1)
-    repetition_rate = repeated / len(bigrams) if bigrams else 0
-
-    # 4. 문장 복잡도 (형태소 개수)
-    complexity = len(pos_tags)
-
-    # 5. 휴지 빈도/길이 (현재 JSON에 없으므로 일단 0.0으로 임시 패딩)
-    pause_time = 0.0
-
-    return [speech_rate, ttr, repetition_rate, complexity, pause_time]
+        # 인코더 마지막 층의 hidden state를 시퀀스 길이만큼 복제해 디코더 입력으로
+        hidden_last = hidden[-1].unsqueeze(1).repeat(1, x.size(1), 1)
+        decoded, _ = self.decoder_lstm(hidden_last)
+        return self.output_layer(decoded)
 
 
-def process_aihub_zip_to_tensor(zip_path, extract_dir='./aihub_data', seq_length=7):
-    """ZIP 압축 해제 -> JSON 파싱 -> 화자별 정렬 -> 3D 텐서 변환"""
+# ── 데이터 로드 ────────────────────────────────────────────
 
-    # 1. ZIP 파일 압축 해제
-    print(f"'{zip_path}' 압축 해제 중...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
+DATA_DIR   = "aihub_data/[라벨]1.AI챗봇"
+SEQ_LENGTH = 7
 
-    # 2. 모든 JSON 파일 찾기
-    json_files = glob.glob(os.path.join(extract_dir, '**', '*.json'), recursive=True)
-    print(f"총 {len(json_files)}개의 JSON 파일을 찾았습니다.")
+records = load_records_from_dir(DATA_DIR)
+voice_data = build_sequences(records, seq_length=SEQ_LENGTH)
 
-    extracted_data = []
-
-    # 3. JSON 파일 순회하며 데이터 및 지표 추출
-    for file_path in json_files:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            stt = data["발화정보"]["stt"]
-            recrd_time = float(data["발화정보"]["recrdTime"])
-            recorder_id = data["녹음자정보"]["recorderId"]
-            recrd_dt = datetime.strptime(data["발화정보"]["recrdDt"], "%Y-%m-%d %H:%M:%S")
-
-            # 피처 5개 뽑기
-            features = extract_features_from_stt(stt, recrd_time)
-
-            extracted_data.append([recorder_id, recrd_dt] + features)
-        except Exception as e:
-            pass  # 손상된 파일이나 형식이 다른 JSON은 가볍게 패스
-
-    # DataFrame으로 변환
-    columns = ['recorder_id', 'date', 'speech_rate', 'ttr', 'repetition_rate', 'complexity', 'pause_time']
-    df = pd.DataFrame(extracted_data, columns=columns)
-
-    # 4. 화자별, 시간순으로 정렬 (LSTM 시계열)
-    df = df.sort_values(by=['recorder_id', 'date'])
-
-    # 5. seq_length만큼 잘라서 3D 텐서로 만들기
-    tensor_list = []
-    grouped = df.groupby('recorder_id')
-
-    for _, group in grouped:
-        features = group[['speech_rate', 'ttr', 'repetition_rate', 'complexity', 'pause_time']].values
-
-        # 데이터가 seq_length(예: 7)보다 많으면 7개씩 잘라서 묶음
-        for i in range(0, len(features) - seq_length + 1, seq_length):
-            sequence = features[i: i + seq_length]
-            tensor_list.append(sequence)
-
-    if not tensor_list:
-        print("시퀀스를 만들기에 데이터가 충분하지 않음.")
-        return None
-
-    # (Batch Size, Seq Length, 5) 형태의 PyTorch Tensor로 최종 변환
-    final_tensor = torch.tensor(np.array(tensor_list), dtype=torch.float32)
-    print(f"변환 완료! 최종 Tensor Shape: {final_tensor.shape}")
-
-    return final_tensor
+if voice_data is None:
+    raise RuntimeError("시퀀스 생성 실패. 데이터를 확인하세요.")
 
 
-zip_filepath = "training_voice_data.zip"
-lstm_input_tensor = process_aihub_zip_to_tensor(zip_filepath, seq_length=7)
+# ── 정규화 ─────────────────────────────────────────────────
 
-voice_data = lstm_input_tensor
-
-# 1. 데이터 정규화 (Z-score Normalization)
-# 피처별로 평균 0, 표준편차 1로 스케일을 맞추기
 mean = voice_data.mean(dim=(0, 1), keepdim=True)
-std = voice_data.std(dim=(0, 1), keepdim=True)
-voice_data_normalized = (voice_data - mean) / (std + 1e-7)
+std  = voice_data.std(dim=(0, 1), keepdim=True)
+voice_data_norm = (voice_data - mean) / (std + 1e-7)
 
-# 2. 미니 배치 데이터로더 생성 (배치 사이즈 32)
-dataset = TensorDataset(voice_data_normalized, voice_data_normalized)
+# 정규화 통계 저장 (추론 시 필요)
+torch.save({"mean": mean, "std": std}, "norm_stats.pt")
+print(f"[train] 정규화 통계 저장 완료")
+
+
+# ── 학습 ───────────────────────────────────────────────────
+
+dataset    = TensorDataset(voice_data_norm, voice_data_norm)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-# 3. 모델 세팅
-model = VoiceLSTMAutoencoder(input_dim=5, hidden_dim=16)
+model     = VoiceLSTMAutoencoder(input_dim=4, hidden_dim=32, num_layers=2)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# 4. 배치 학습 루프
-epochs = 1000  # 학습 횟수를 1000번으로 증가
-for epoch in range(epochs):
-    model.train()
-    epoch_loss = 0
+EPOCHS = 100
+print(f"[train] 학습 시작 ({EPOCHS} epochs, {len(dataloader)} batches/epoch)")
 
-    # 32개씩 잘라서 학습
+for epoch in range(EPOCHS):
+    model.train()
+    epoch_loss = 0.0
+
     for batch_x, batch_y in dataloader:
         optimizer.zero_grad()
-
-        reconstructed = model(batch_x)
-        loss = criterion(reconstructed, batch_y)
-
+        loss = criterion(model(batch_x), batch_y)
         loss.backward()
         optimizer.step()
-
         epoch_loss += loss.item()
 
-    if (epoch + 1) % 100 == 0:
-        # 미니 배치들의 평균 Loss 출력
-        print(f'Epoch [{epoch + 1}/{epochs}], Loss: {epoch_loss / len(dataloader):.6f}')
+    if (epoch + 1) % 10 == 0:
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"  Epoch [{epoch+1}/{EPOCHS}]  Loss: {avg_loss:.6f}")
+
+
+# ── 학습 오차 분포 계산 (이상 탐지 임계값 기준) ───────────
+
+model.eval()
+with torch.no_grad():
+    all_errors = []
+    for (batch_x,) in DataLoader(TensorDataset(voice_data_norm), batch_size=256):
+        recon = model(batch_x)
+        errors = ((recon - batch_x) ** 2).mean(dim=(1, 2))
+        all_errors.append(errors)
+
+    all_errors = torch.cat(all_errors)
+    threshold_mean = all_errors.mean().item()
+    threshold_std  = all_errors.std().item()
+    threshold = threshold_mean + 2 * threshold_std  # 정상 범위 상한
+
+print(f"\n[train] 재구성 오차 — mean: {threshold_mean:.6f}, std: {threshold_std:.6f}")
+print(f"[train] 이상 탐지 임계값 (mean + 2σ): {threshold:.6f}")
+
+
+# ── 저장 ───────────────────────────────────────────────────
+
+torch.save(model.state_dict(), "voice_autoencoder.pt")
+torch.save({"threshold": threshold, "mean": threshold_mean, "std": threshold_std},
+           "threshold.pt")
+
+print("\n[train] 저장 완료:")
+print("  voice_autoencoder.pt  — 모델 가중치")
+print("  norm_stats.pt         — 정규화 통계 (mean/std)")
+print("  threshold.pt          — 이상 탐지 임계값")
