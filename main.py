@@ -53,7 +53,7 @@ vision_mean = None
 vision_std = None
 
 # 시뮬레이션에서 도출한 최종 앙상블 임계값 (필요시 수정!!!!!!!!!!!)
-ENSEMBLE_THRESHOLD = 5.0
+ENSEMBLE_THRESHOLD = 5.1
 
 # 4. 서버 시작 시 가중치 및 통계 로드 (Startup Event)
 @app.on_event("startup")
@@ -68,7 +68,7 @@ async def startup_event():
 
         # 가중치 덮어씌우기
         voice_model.load_state_dict(torch.load('voice_lstm_model.pth', map_location='cpu'))
-        vision_model.load_state_dict(torch.load('vision_autoencoder.pt', map_location='cpu'))
+        vision_model.load_state_dict(torch.load('aihub_data/vision_autoencoder.pt', map_location='cpu'))
 
         # 평가 모드 전환
         voice_model.eval()
