@@ -90,7 +90,7 @@ with torch.no_grad():
 # ==========================================
 # 5. 통계적 결과 출력
 # ==========================================
-print(f"--- 📊 {num_test_samples}개 대규모 가상 데이터 검증 결과 ---")
+print(f"--- {num_test_samples}개 대규모 가상 데이터 검증 결과 ---")
 print(f"[정상 그룹] 평균 변화 점수: {scores_normal.mean():.6f} (표준편차: {scores_normal.std():.4f})")
 print(f"[이상 그룹] 평균 변화 점수: {scores_abnormal.mean():.6f} (표준편차: {scores_abnormal.std():.4f})")
 print(f"\n이상 그룹이 정상 그룹 대비 평균 {scores_abnormal.mean() / scores_normal.mean():.1f}배 높은 점수를 기록했습니다.")
